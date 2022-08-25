@@ -10,6 +10,9 @@ public class DbConfig {
     public static final String DYNAMODB_URL = "http://localhost:8000";
     public static final Region REGION = Region.US_WEST_2;
 
+    public static final long DEFAULT_READ_CAPACITY_UNITS = 10L;
+    public static final long DEFAULT_WRITE_CAPACITY_UNITS = 10L;
+
     public static final String TABLE_NAME = "sampleStreamedTable";
 
 }
