@@ -7,6 +7,7 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsAsyncClient;
 
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 import static co.novandi.diaz.config.DbConfig.TABLE_NAME;
@@ -21,66 +22,68 @@ public class DbStreamListener {
     private DynamoDbStreamsAsyncClient asyncStreamsClient;
 
     public void listen() {
-        var describeTableRequest = DescribeTableRequest.builder().tableName(TABLE_NAME).build();
-        var describeTableAsyncResult = asyncDbClient.describeTable(describeTableRequest);
+        asyncDbClient.describeTable(DescribeTableRequest.builder()
+                        .tableName(TABLE_NAME)
+                        .build())
+                .whenComplete((describeTableResponse, describeTableError) ->
+                        Optional.ofNullable(describeTableResponse).ifPresentOrElse(
+                                this::observeTable,
+                                () -> log.info("Unable to get the value of the describeTableAsyncResult. Reason: " + describeTableError.getMessage())))
+                .join();
+    }
 
-        describeTableAsyncResult.whenComplete((describeTableResponse, describeTableError) -> {
-            if (describeTableResponse != null) {
-                var tableDescription = describeTableResponse.table();
-                var streamSpecification = tableDescription.streamSpecification();
-                log.info("Stream view type: " + streamSpecification.streamViewType());
+    private void observeTable(DescribeTableResponse describeTableResponse) {
+        this.observeTableStream(describeTableResponse.table().latestStreamArn());
+    }
 
-                String streamArn = tableDescription.latestStreamArn();
-                log.info("Stream ARN: " + streamArn);
+    private void observeTableStream(String tableStreamArn) {
+        log.info("Observing table stream ARN: {}", tableStreamArn);
 
-                var describeStreamRequest = DescribeStreamRequest.builder().streamArn(streamArn).build();
-                var describeStreamsAsyncResult = asyncStreamsClient.describeStream(describeStreamRequest);
+        asyncStreamsClient.describeStream(DescribeStreamRequest.builder()
+                        .streamArn(tableStreamArn)
+                        .build())
+                .whenComplete((describeStreamResponse, describeStreamsError) ->
+                        Optional.ofNullable(describeStreamResponse).ifPresentOrElse(
+                                response -> response.streamDescription().shards().forEach(shard -> this.observeShard(shard, tableStreamArn)),
+                                () -> log.error("Unable to observe the table stream {}. Reason: {}", tableStreamArn, describeStreamsError.getMessage())))
+                .join();
+    }
 
-                describeStreamsAsyncResult.whenComplete((describeStreamsResponse, describeStreamsError) -> {
-                    if (describeStreamsResponse != null) {
-                        describeStreamsResponse.streamDescription().shards().forEach(shard -> {
-                            String shardId = shard.shardId();
-                            log.info("Shard ID: " + shardId);
+    private void observeShard(Shard shard, String tableStreamArn) {
+        String shardId = shard.shardId();
+        log.info("Observing shard ID: {}", shardId);
 
-                            var getShardIteratorRequest = GetShardIteratorRequest.builder()
-                                    .streamArn(streamArn)
-                                    .shardId(shardId)
-                                    .shardIteratorType(ShardIteratorType.LATEST)
-                                    .build();
-                            var getShardIteratorAsyncResult = asyncStreamsClient.getShardIterator(getShardIteratorRequest);
+        asyncStreamsClient.getShardIterator(GetShardIteratorRequest.builder()
+                        .streamArn(tableStreamArn)
+                        .shardId(shardId)
+                        .shardIteratorType(ShardIteratorType.LATEST)
+                        .build())
+                .whenComplete((getShardIteratorResponse, getShardIteratorError) ->
+                        Optional.ofNullable(getShardIteratorResponse).ifPresentOrElse(
+                                this::listenToRecordChanges,
+                                () -> log.error("Unable to iterate on shard: {}. Reason: {}", shardId, getShardIteratorError.getMessage())))
+                .join();
+    }
 
-                            getShardIteratorAsyncResult.whenComplete((getShardIteratorResponse, getShardIteratorError) -> {
-                                if (getShardIteratorResponse != null) {
-                                    String currentShardIterator = getShardIteratorResponse.shardIterator();
-                                    while (currentShardIterator != null) {
-                                        var getRecordsRequest = GetRecordsRequest.builder().shardIterator(currentShardIterator).limit(100).build();
-                                        var getRecordsAsyncResult = asyncStreamsClient.getRecords(getRecordsRequest);
+    private void listenToRecordChanges(GetShardIteratorResponse getShardIteratorResponse) {
+        final long executionTimeoutInSeconds = 10L;
+        final int maxNumberOfReturnedRecords = 100;
 
-                                        try {
-                                            GetRecordsResponse getRecordsResponse = getRecordsAsyncResult.get(10L, TimeUnit.SECONDS);
-                                            getRecordsResponse.records().forEach(record -> log.info("RECORD: " + record.dynamodb()));
-                                            currentShardIterator = getRecordsResponse.nextShardIterator();
-                                        } catch (Exception e) {
-                                            log.error("Unable to get the value of the getRecordsAsyncResult. Reason: " + e.getMessage());
-                                        }
-                                        getRecordsAsyncResult.join();
-                                    }
-                                } else {
-                                    log.error("Unable to get the value of the getShardIteratorAsyncResult. Reason: " + getShardIteratorError.getMessage());
-                                }
-                            });
-                            getShardIteratorAsyncResult.join();
-                        });
-                    } else {
-                        log.error("Unable to get the value of the describeStreamsAsyncResult. Reason: " + describeStreamsError.getMessage());
-                    }
-                });
-                describeStreamsAsyncResult.join();
-            } else {
-                log.info("Unable to get the value of the describeTableAsyncResult. Reason: " + describeTableError.getMessage());
+        String currentShardIterator = getShardIteratorResponse.shardIterator();
+        while (currentShardIterator != null) {
+            var getRecordsAsyncResult = asyncStreamsClient.getRecords(GetRecordsRequest.builder()
+                    .shardIterator(currentShardIterator)
+                    .limit(maxNumberOfReturnedRecords)
+                    .build());
+            try {
+                GetRecordsResponse getRecordsResponse = getRecordsAsyncResult.get(executionTimeoutInSeconds, TimeUnit.SECONDS);
+                getRecordsResponse.records().forEach(record -> log.info("RECORD: " + record.dynamodb()));
+                currentShardIterator = getRecordsResponse.nextShardIterator();
+            } catch (Exception e) {
+                log.error("Unable to listen to record changes. Reason: " + e.getMessage());
             }
-        });
-        describeTableAsyncResult.join();
+            getRecordsAsyncResult.join();
+        }
     }
 
 }
