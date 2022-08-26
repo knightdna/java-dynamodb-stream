@@ -7,6 +7,7 @@ import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.model.*;
 import software.amazon.awssdk.services.dynamodb.streams.DynamoDbStreamsAsyncClient;
 
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -44,7 +45,9 @@ public class DbStreamListener {
                         .build())
                 .whenComplete((describeStreamResponse, describeStreamsError) ->
                         Optional.ofNullable(describeStreamResponse).ifPresentOrElse(
-                                response -> response.streamDescription().shards().forEach(shard -> this.observeShard(shard, tableStreamArn)),
+                                response -> response.streamDescription().shards().stream()
+                                        .filter(shard -> Objects.isNull(shard.sequenceNumberRange().endingSequenceNumber()))
+                                        .forEach(shard -> this.observeShard(shard, tableStreamArn)),
                                 () -> log.error("Unable to observe the table stream {}. Reason: {}", tableStreamArn, describeStreamsError.getMessage())))
                 .join();
     }
